@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: List
+items:
+- apiVersion: core.federation.k8s.io/v1alpha1
+  kind: FederatedConfigMapPlacement
+  metadata:
+    name: istio-grafana-custom-resources
+    namespace: istio-system
+  spec:
+    clusternames:
+    - cluster1
+    - cluster2
