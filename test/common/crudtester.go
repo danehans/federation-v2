@@ -337,7 +337,13 @@ func (c *FederatedTypeCrudTester) CheckPropagation(template, placement, override
 		return
 	}
 
-	version, err := c.waitForPropagatedVersion(template, placement, override)
+	var clusterPropVersion *fedv1a1.ClusterPropagatedVersion
+	var propVersion *fedv1a1.PropagatedVersion
+	if c.typeConfig.GetNamespaced() {
+		propVersion, err = c.waitForPropagatedVersion(template, placement, override)
+	} else {
+		clusterPropVersion, err = c.waitForClusterPropagatedVersion(template, placement, override)
+	}
 	if err != nil {
 		c.tl.Fatalf("Error waiting for propagated version for %s %q: %v", targetKind, qualifiedName, err)
 	}
@@ -352,7 +358,12 @@ func (c *FederatedTypeCrudTester) CheckPropagation(template, placement, override
 		}
 		c.tl.Logf("Waiting for %s %q %s cluster %q", targetKind, qualifiedName, operation, clusterName)
 
-		expectedVersion := c.propagatedVersion(version, clusterName)
+		var expectedVersion string
+		if c.typeConfig.GetNamespaced() {
+			expectedVersion = c.propagatedVersion(propVersion, clusterName)
+		} else {
+			expectedVersion = c.clusterPropagatedVersion(clusterPropVersion, clusterName)
+		}
 		if objExpected {
 			if expectedVersion == "" {
 				c.tl.Fatalf("Failed to determine expected version of %s %q in cluster %q.", targetKind, qualifiedName, clusterName)
@@ -490,6 +501,65 @@ func (c *FederatedTypeCrudTester) waitForPropagatedVersion(template, placement, 
 	return version, nil
 }
 
+func (c *FederatedTypeCrudTester) waitForClusterPropagatedVersion(template, placement, override *unstructured.Unstructured) (*fedv1a1.ClusterPropagatedVersion, error) {
+	targetKind := c.typeConfig.GetTarget().Kind
+
+	overrideVersion := ""
+	if override != nil {
+		overrideVersion = override.GetResourceVersion()
+	}
+
+	name := template.GetName()
+	namespace := template.GetNamespace()
+
+	versionName := common.PropagatedVersionName(targetKind, name)
+
+	clusterNames, err := util.GetClusterNames(placement)
+	if err != nil {
+		c.tl.Fatalf("Error retrieving cluster names: %v", err)
+	}
+	selectedClusters := sets.NewString(clusterNames...)
+
+	if targetKind == util.NamespaceKind {
+		// Delete the primary cluster as it will never be included in
+		// PropagatedVersion's list of cluster versions.
+		selectedClusters.Delete(c.getPrimaryClusterName())
+	}
+
+	client := c.fedResourceClient(c.typeConfig.GetTemplate())
+
+	var version *fedv1a1.ClusterPropagatedVersion
+	err = wait.PollImmediate(c.waitInterval, c.clusterWaitTimeout, func() (bool, error) {
+		var err error
+		version, err = c.fedClient.CoreV1alpha1().ClusterPropagatedVersions().Get(versionName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		template, err := client.Resources(namespace).Get(name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		if version.Status.TemplateVersion == template.GetResourceVersion() && version.Status.OverrideVersion == overrideVersion {
+			// Check that the list of clusters propagated to matches the list of selected clusters
+			propagatedClusters := sets.String{}
+			for _, clusterVersion := range version.Status.ClusterVersions {
+				propagatedClusters.Insert(clusterVersion.ClusterName)
+			}
+			if propagatedClusters.Equal(selectedClusters) {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return version, nil
+}
+
 func (c *FederatedTypeCrudTester) getPrimaryClusterName() string {
 	for name, testCluster := range c.testClusters {
 		if testCluster.IsPrimary {
@@ -517,6 +587,22 @@ func (c *FederatedTypeCrudTester) deleteOneNonPrimaryCluster(clusterNames []stri
 func (c *FederatedTypeCrudTester) propagatedVersion(version *fedv1a1.PropagatedVersion, clusterName string) string {
 	// For namespaces, since we do not store the primary cluster's namespace
 	// version in PropagatedVersion's ClusterVersions slice, grab it from the
+	// TemplateVersion field instead.
+	if c.typeConfig.GetTarget().Kind == util.NamespaceKind && clusterName == c.getPrimaryClusterName() {
+		return version.Status.TemplateVersion
+	}
+
+	for _, clusterVersion := range version.Status.ClusterVersions {
+		if clusterVersion.ClusterName == clusterName {
+			return clusterVersion.Version
+		}
+	}
+	return ""
+}
+
+func (c *FederatedTypeCrudTester) clusterPropagatedVersion(version *fedv1a1.ClusterPropagatedVersion, clusterName string) string {
+	// For namespaces, since we do not store the primary cluster's namespace
+	// version in ClusterPropagatedVersion's ClusterVersions slice, grab it from the
 	// TemplateVersion field instead.
 	if c.typeConfig.GetTarget().Kind == util.NamespaceKind && clusterName == c.getPrimaryClusterName() {
 		return version.Status.TemplateVersion
