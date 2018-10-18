@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	apicommon "github.com/kubernetes-sigs/federation-v2/pkg/apis/core/common"
 	apiextv1b1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apiextv1b1client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -28,9 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 
-	apicommon "github.com/kubernetes-sigs/federation-v2/pkg/apis/core/common"
 	fedv1a1 "github.com/kubernetes-sigs/federation-v2/pkg/apis/core/v1alpha1"
 	"github.com/kubernetes-sigs/federation-v2/pkg/controller/util"
+	"github.com/kubernetes-sigs/federation-v2/pkg/kubefed2"
 	"github.com/kubernetes-sigs/federation-v2/test/common"
 	"github.com/kubernetes-sigs/federation-v2/test/e2e/framework"
 
@@ -40,13 +41,13 @@ import (
 var _ = Describe("Federated CRD resources", func() {
 	f := framework.NewFederationFramework("crd-resources")
 
-	scopes := []apiextv1b1.ResourceScope{
-		apiextv1b1.ClusterScoped,
-		apiextv1b1.NamespaceScoped,
+	namespaceScoped := []bool{
+		true,
+		false,
 	}
-	for i, _ := range scopes {
-		scope := scopes[i]
-		Describe(fmt.Sprintf("with scope=%s", scope), func() {
+	for i, _ := range namespaceScoped {
+		namespaced := namespaceScoped[i]
+		Describe(fmt.Sprintf("with namespaced=%v", namespaced), func() {
 			It("should be created, read, updated and deleted successfully", func() {
 				if framework.TestContext.LimitedScope {
 					// The service account of member clusters for
@@ -58,21 +59,28 @@ var _ = Describe("Federated CRD resources", func() {
 					framework.Skipf("Validation of cr federation is not supported for namespaced federation.")
 				}
 
-				targetCrdKind := "FedTestCrd"
-				if scope == apiextv1b1.ClusterScoped {
-					targetCrdKind = fmt.Sprintf("%s%s", scope, targetCrdKind)
+				targetCrdKind := "TestFedTarget"
+				if !namespaced {
+					targetCrdKind = fmt.Sprintf("Cluster%s", targetCrdKind)
 				}
-				validateCrdCrud(f, targetCrdKind, scope)
+				validateCrdCrud(f, targetCrdKind, namespaced)
 			})
 		})
 	}
+
 })
 
-func validateCrdCrud(f framework.FederationFramework, targetCrdKind string, scope apiextv1b1.ResourceScope) {
+func validateCrdCrud(f framework.FederationFramework, targetCrdKind string, namespaced bool) {
 	tl := framework.NewE2ELogger()
 
-	targetCrd := newTestCrd(targetCrdKind, scope)
-	targetCrdName := targetCrd.GetName()
+	targetAPIResource := metav1.APIResource{
+		Group:      "example.com",
+		Version:    "v1alpha1",
+		Kind:       targetCrdKind,
+		Name:       fedv1a1.PluralName(targetCrdKind),
+		Namespaced: namespaced,
+	}
+	targetCrd := kubefed2.CrdForAPIResource(targetAPIResource)
 
 	userAgent := fmt.Sprintf("test-%s-crud", strings.ToLower(targetCrdKind))
 
@@ -93,45 +101,21 @@ func validateCrdCrud(f framework.FederationFramework, targetCrdKind string, scop
 		}
 	}
 
-	// Create a template crd
-	templateKind := fmt.Sprintf("Federated%s", targetCrdKind)
-	templateCrd := newTestCrd(templateKind, scope)
-	createCrdForHost(tl, hostCrdClient, templateCrd)
+	typeConfig := kubefed2.TypeConfigForTarget(
+		targetAPIResource, apicommon.ResourceVersionField,
+		targetAPIResource.Group, targetAPIResource.Version,
+	)
 
-	// Create a placement crd
-	placementKind := fmt.Sprintf("Federated%sPlacement", targetCrdKind)
-	placementCrd := newTestCrd(placementKind, scope)
-	createCrdForHost(tl, hostCrdClient, placementCrd)
-
-	// Create a type config for these types
-	version := "v1alpha1"
-	fedNamespace := f.FederationSystemNamespace()
-	typeConfig := &fedv1a1.FederatedTypeConfig{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      targetCrdName,
-			Namespace: fedNamespace,
-		},
-		Spec: fedv1a1.FederatedTypeConfigSpec{
-			Target: fedv1a1.APIResource{
-				Version: version,
-				Kind:    targetCrdKind,
-			},
-			Namespaced:         scope == apiextv1b1.NamespaceScoped,
-			ComparisonField:    apicommon.ResourceVersionField,
-			PropagationEnabled: true,
-			Template: fedv1a1.APIResource{
-				Group:   "example.com",
-				Version: version,
-				Kind:    templateKind,
-			},
-			Placement: fedv1a1.APIResource{
-				Kind: placementKind,
-			},
-		},
+	for _, apiResource := range []metav1.APIResource{
+		typeConfig.GetTemplate(),
+		typeConfig.GetPlacement(),
+	} {
+		crd, err := kubefed2.CreateCrdFromResource(hostCrdClient, apiResource)
+		if err != nil {
+			tl.Fatal("Error creating primitives: %v", err)
+		}
+		ensureCRDRemoval(tl, hostCrdClient, crd.Name, "")
 	}
-
-	// Set defaults that would normally be set by the api
-	fedv1a1.SetFederatedTypeConfigDefaults(typeConfig)
 
 	// Wait for the CRDs to become available in the API
 	for _, pool := range pools {
@@ -145,11 +129,16 @@ func validateCrdCrud(f framework.FederationFramework, targetCrdKind string, scop
 	// will be started for the crd.
 	if !framework.TestContext.InMemoryControllers {
 		fedClient := f.FedClient(userAgent)
-		_, err := fedClient.CoreV1alpha1().FederatedTypeConfigs(fedNamespace).Create(typeConfig)
+		fedNamespace := f.FederationSystemNamespace()
+		concreteTypeConfig := typeConfig.(*fedv1a1.FederatedTypeConfig)
+		_, err := fedClient.CoreV1alpha1().FederatedTypeConfigs(fedNamespace).Create(concreteTypeConfig)
 		if err != nil {
-			tl.Fatalf("Error creating FederatedTypeConfig for type %q: %v", targetCrdName, err)
+			tl.Fatalf("Error creating FederatedTypeConfig for %q: %v", concreteTypeConfig.Name, err)
 		}
-		defer fedClient.CoreV1alpha1().FederatedTypeConfigs(fedNamespace).Delete(typeConfig.Name, nil)
+		framework.AddCleanupAction(func() {
+			fedClient.CoreV1alpha1().FederatedTypeConfigs(fedNamespace).Delete(concreteTypeConfig.Name, nil)
+		})
+
 		// TODO(marun) Wait until the controller has started
 	}
 
@@ -164,12 +153,12 @@ spec:
     spec:
       bar: baz
 `
-		data := fmt.Sprintf(templateYaml, "example.com/v1alpha1", templateKind)
+		data := fmt.Sprintf(templateYaml, "example.com/v1alpha1", typeConfig.GetTemplate().Kind)
 		template, err = common.ReaderToObj(strings.NewReader(data))
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("Error reading test template: %v", err)
 		}
-		if scope == apiextv1b1.NamespaceScoped {
+		if namespaced {
 			template.SetNamespace(namespace)
 		}
 
@@ -183,26 +172,6 @@ spec:
 
 	validateCrud(f, tl, typeConfig, testObjectFunc)
 
-}
-
-func newTestCrd(kind string, scope apiextv1b1.ResourceScope) *apiextv1b1.CustomResourceDefinition {
-	plural := fedv1a1.PluralName(kind)
-	group := "example.com"
-	return &apiextv1b1.CustomResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("%s.%s", plural, group),
-		},
-		Spec: apiextv1b1.CustomResourceDefinitionSpec{
-			Group:   group,
-			Version: "v1alpha1",
-			Scope:   scope,
-			Names: apiextv1b1.CustomResourceDefinitionNames{
-				Plural:   plural,
-				Singular: strings.ToLower(kind),
-				Kind:     kind,
-			},
-		},
-	}
 }
 
 func waitForCrd(pool dynamic.ClientPool, tl common.TestLogger, apiResource metav1.APIResource) {
@@ -227,23 +196,26 @@ func createCrdForHost(tl common.TestLogger, client *apiextv1b1client.Apiextensio
 }
 
 func createCrd(tl common.TestLogger, client *apiextv1b1client.ApiextensionsV1beta1Client, crd *apiextv1b1.CustomResourceDefinition, clusterName string) *apiextv1b1.CustomResourceDefinition {
-	clusterMsg := "host cluster"
-	if len(clusterName) > 0 {
-		clusterMsg = fmt.Sprintf("cluster %q", clusterName)
-	}
 	createdCrd, err := client.CustomResourceDefinitions().Create(crd)
 	if err != nil {
-		tl.Fatalf("Error creating crd %s in %s: %v", crd.Name, clusterMsg, err)
+		tl.Fatalf("Error creating crd %s in %s: %v", crd.Name, clusterMsg(clusterName), err)
 	}
+	ensureCRDRemoval(tl, client, createdCrd.Name, clusterName)
+	return createdCrd
+}
 
-	// Using a cleanup action is more reliable than defer()
+func ensureCRDRemoval(tl common.TestLogger, client *apiextv1b1client.ApiextensionsV1beta1Client, crdName, clusterName string) {
 	framework.AddCleanupAction(func() {
-		crdName := createdCrd.Name
 		err := client.CustomResourceDefinitions().Delete(crdName, nil)
 		if err != nil {
-			tl.Errorf("Error deleting crd %q in %s: %v", crdName, clusterMsg, err)
+			tl.Errorf("Error deleting crd %q in %s: %v", crdName, clusterMsg(clusterName), err)
 		}
 	})
+}
 
-	return createdCrd
+func clusterMsg(clusterName string) string {
+	if len(clusterName) > 0 {
+		return fmt.Sprintf("cluster %q", clusterName)
+	}
+	return "host cluster"
 }
